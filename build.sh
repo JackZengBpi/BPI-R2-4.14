@@ -10,19 +10,54 @@ crosscompile=0
 if [[ -z $(cat /proc/cpuinfo | grep -i 'model name.*ArmV7') ]]; then
 	if [[ -z "$(which arm-linux-gnueabihf-gcc)" ]];then echo "please install gcc-arm-linux-gnueabihf";exit 1;fi
 
-	export ARCH=arm;export CROSS_COMPILE=arm-linux-gnueabihf-
+	CCVER=$(arm-linux-gnueabihf-gcc --version |grep arm| sed -e 's/^.* \([0-9]\.[0-9-]\).*$/\1/')
+#	if [[ $CCVER =~ ^7 ]]; then
+#		echo "arm-linux-gnueabihf-gcc version 7 currently not supported";exit 1;
+#	fi
+
+	export ARCH=arm;export CROSS_COMPILE='ccache arm-linux-gnueabihf-'
 	crosscompile=1
 fi;
 
 #Check Dependencies
 PACKAGE_Error=0
-for package in "u-boot-tools" "bc" "make" "gcc" "libc6-dev" "libncurses5-dev" "libssl-dev"; do
-	if [[ -z "$(dpkg -l |grep ${package})" ]];then echo "please install ${package}";PACKAGE_Error=1;fi
+for package in "u-boot-tools" "bc" "make" "gcc" "libc6-dev" "libncurses5-dev" "libssl-dev" "fakeroot" "ccache"; do
+	TESTPKG=$(dpkg -l |grep "\s${package}")
+	if [[ -z "${TESTPKG}" ]];then echo "please install ${package}";PACKAGE_Error=1;fi
 done
 if [ ${PACKAGE_Error} == 1 ]; then exit 1; fi
 
 kernver=$(make kernelversion)
-gitbranch=$(git rev-parse --abbrev-ref HEAD)
+kernbranch=$(git rev-parse --abbrev-ref HEAD)
+gitbranch=$(git rev-parse --abbrev-ref HEAD|sed 's/^4\.[0-9]\+-//')
+
+function increase_kernel {
+        #echo $kernver
+        old_IFS=$IFS
+        IFS='.'
+        read -ra KV <<< "$kernver"
+        IFS=','
+        newkernver=${KV[0]}"."${KV[1]}"."$(( ${KV[2]} +1 ))
+        echo $newkernver
+}
+
+function update_kernel_source {
+        changedfiles=$(git diff --name-only)
+        if [[ -z "$changedfiles" ]]; then
+        git fetch stable
+        ret=$?
+        if [[ $ret -eq 0 ]];then
+                newkernver=$(increase_kernel)
+                echo "newkernver:$newkernver"
+                git merge v$newkernver
+        elif [[ $ret -eq 128 ]];then
+                #repo not found
+                git remote add stable https://git.kernel.org/pub/scm/linux/kern$
+        fi
+        else
+                echo "please first commit/stash modified files: $changedfiles"
+        fi
+}
 
 function pack {
 	prepare_SD
@@ -37,8 +72,15 @@ function pack {
 }
 
 function install {
+
+	imagename="uImage_${kernver}-${gitbranch}"
+	read -e -i $imagename -p "uImage-filename: " input
+	imagename="${input:-$imagename}"
+
+	echo "Name: $imagename"
+
 	if [[ $crosscompile -eq 0 ]]; then
-		kernelfile=/boot/bananapi/bpi-r2/linux/uImage
+		kernelfile=/boot/bananapi/bpi-r2/linux/$imagename
 		if [[ -e $kernelfile ]];then
 			echo "backup of kernel: $kernelfile.bak"
 			cp $kernelfile $kernelfile.bak
@@ -48,15 +90,17 @@ function install {
 			echo "actual Kernel not found...is /boot mounted?"
 		fi
 	else
+		echo "by default this kernel-file will be loaded (uEnv.txt):"
+		grep '^kernel=' /media/${USER}/BPI-BOOT/bananapi/bpi-r2/linux/uEnv.txt|tail -1
 		read -p "Press [enter] to copy data to SD-Card..."
 		if  [[ -d /media/$USER/BPI-BOOT ]]; then
-			kernelfile=/media/$USER/BPI-BOOT/bananapi/bpi-r2/linux/uImage
+			kernelfile=/media/$USER/BPI-BOOT/bananapi/bpi-r2/linux/$imagename
 			if [[ -e $kernelfile ]];then
 				echo "backup of kernel: $kernelfile.bak"
 				cp $kernelfile $kernelfile.bak
 			fi
 			echo "copy new kernel"
-			cp ./uImage /media/$USER/BPI-BOOT/bananapi/bpi-r2/linux/uImage
+			cp ./uImage $kernelfile
 			echo "copy modules (root needed because of ext-fs permission)"
 			export INSTALL_MOD_PATH=/media/$USER/BPI-ROOT/;
 			echo "INSTALL_MOD_PATH: $INSTALL_MOD_PATH"
@@ -84,6 +128,62 @@ function install {
 			echo "SD-Card not found!"
 		fi
 	fi
+}
+
+function deb {
+#set -x
+  ver=${kernver}-bpi-r2-${gitbranch}
+  uimagename=uImage_${kernver}-${gitbranch}
+  echo "deb package ${ver}"
+  prepare_SD
+
+#    cd ../SD
+#    fname=bpi-r2_${kernver}_${gitbranch}.tar.gz
+#    tar -cz --owner=root --group=root -f $fname BPI-BOOT BPI-ROOT
+
+  mkdir -p debian/bananapi-r2-image/boot/bananapi/bpi-r2/linux/
+  mkdir -p debian/bananapi-r2-image/lib/modules/
+  mkdir -p debian/bananapi-r2-image/DEBIAN/
+  rm debian/bananapi-r2-image/boot/bananapi/bpi-r2/linux/*
+  rm -rf debian/bananapi-r2-image/lib/modules/*
+
+  #sudo mount --bind ../SD/BPI-ROOT/lib/modules debian/bananapi-r2-image/lib/modules/
+  if test -e ./uImage && test -d ../SD/BPI-ROOT/lib/modules/${ver}; then
+    cp ./uImage debian/bananapi-r2-image/boot/bananapi/bpi-r2/linux/${uimagename}
+#    pwd
+    cp -r ../SD/BPI-ROOT/lib/modules/${ver} debian/bananapi-r2-image/lib/modules/
+    #rm debian/bananapi-r2-image/lib/modules/${ver}/{build,source}
+    #mkdir debian/bananapi-r2-image/lib/modules/${ver}/kernel/extras
+    #cp cryptodev-linux/cryptodev.ko debian/bananapi-r2-image/lib/modules/${ver}/kernel/extras
+	cat > debian/bananapi-r2-image/DEBIAN/postinst << EOF
+#!/bin/sh
+echo "kernel=${uimagename}">>/boot/bananapi/bpi-r2/linux/uEnv.txt
+EOF
+	cat > debian/bananapi-r2-image/DEBIAN/postrm << EOF
+#!/bin/sh
+cp /boot/bananapi/bpi-r2/linux/uEnv.txt /boot/bananapi/bpi-r2/linux/uEnv.txt.bak
+grep -v  ${uimagename} /boot/bananapi/bpi-r2/linux/uEnv.txt.bak > /boot/bananapi/bpi-r2/linux/uEnv.txt
+EOF
+    cat > debian/bananapi-r2-image/DEBIAN/control << EOF
+Package: bananapi-r2-image-${kernbranch}
+Version: ${kernver}-1
+Section: custom
+Priority: optional
+Architecture: armhf
+Multi-Arch: no
+Essential: no
+Maintainer: Frank Wunderlich
+Description: BPI-R2 linux image ${ver}
+EOF
+    cd debian
+    fakeroot dpkg-deb --build bananapi-r2-image ../debian
+    cd ..
+    ls -lh debian/*.deb
+    dpkg -c debian/bananapi-r2-image-${kernbranch,,}_${kernver}-1_armhf.deb
+  else
+    echo "First build kernel ${ver}"
+    echo "eg: ./build"
+  fi
 }
 
 function build {
@@ -176,17 +276,30 @@ if [ -n "$kernver" ]; then
 			git pull
 			;;
 
-  		"umount")
+                "updatesrc")
+                        echo "Update kernel source"
+                        update_kernel_source
+                        ;;
+
+ 		"umount")
 			echo "Umount SD Media"
 			umount /media/$USER/BPI-BOOT
 			umount /media/$USER/BPI-ROOT
+			;;
+
+ 		"uenv")
+			echo "edit uEnv.txt"
+			nano /media/$USER/BPI-BOOT/bananapi/bpi-r2/linux/uEnv.txt
 			;;
 
 		"defconfig")
 			echo "Edit def config"
 			nano arch/arm/configs/mt7623n_evb_fwu_defconfig
 			;;
-
+		"deb")
+			echo "deb-package (currently testing-state)"
+			deb
+			;;
 		"dtsi")
 			echo "Edit mt7623.dtsi"
 			nano arch/arm/boot/dts/mt7623.dtsi

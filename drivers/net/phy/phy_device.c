@@ -1686,11 +1686,8 @@ EXPORT_SYMBOL(genphy_loopback);
 
 static int __set_phy_supported(struct phy_device *phydev, u32 max_speed)
 {
-	/* The default values for phydev->supported are provided by the PHY
-	 * driver "features" member, we want to reset to sane defaults first
-	 * before supporting higher speeds.
-	 */
-	phydev->supported &= PHY_DEFAULT_FEATURES;
+	phydev->supported &= ~(PHY_1000BT_FEATURES | PHY_100BT_FEATURES |
+			       PHY_10BT_FEATURES);
 
 	switch (max_speed) {
 	default:
@@ -1923,7 +1920,7 @@ static struct phy_driver genphy_driver = {
 	.config_init	= genphy_config_init,
 	.features	= PHY_GBIT_FEATURES | SUPPORTED_MII |
 			  SUPPORTED_AUI | SUPPORTED_FIBRE |
-			  SUPPORTED_BNC,
+			  SUPPORTED_BNC | SUPPORTED_Pause | SUPPORTED_Asym_Pause,
 	.config_aneg	= genphy_config_aneg,
 	.aneg_done	= genphy_aneg_done,
 	.read_status	= genphy_read_status,
